@@ -1,0 +1,96 @@
+name: python-backstage-app-cicd
+
+on:
+  push:
+    paths:
+      - src/**
+    branches:
+      - main
+permissions:
+  contents: write  # Add this to allow pushing commits
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Shorten commit id
+        shell: bash
+        run: |
+          echo "COMMIT_ID=${GITHUB_SHA::6}" >> "$GITHUB_ENV"
+      -
+        name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          push: true
+          tags: cdproyect/python-backstage-app:${{ env.COMMIT_ID }}
+    outputs:
+      commit_id: ${{ env.COMMIT_ID }}
+  
+  cd:
+    needs: ci
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Modify values file
+        shell: bash
+        run: |
+          echo ${{needs.ci.outputs.commit_id}}
+          sudo apt-get update && sudo apt-get install -y python3 python3-pip
+          python3 -m pip install yq --break-system-packages
+          yq -Yi '.image.tag = "${{needs.ci.outputs.commit_id}}"' charts/python-backstage-app/values-dev.yaml
+        
+      - name: Commit changes
+        uses: EndBug/add-and-commit@v9
+        with:
+          message: "Updates values.yaml with commit id ${{needs.ci.outputs.commit_id}}"
+          pull_strategy: '--ff-only'
+      
+      - name: Install argocd
+        shell: bash
+        run: |
+          sudo curl -ksSL -o argocd argo-cd-argocd-server.argocd/download/argocd-linux-amd64
+          sudo chmod +x argocd
+          sudo mv ./argocd /usr/local/bin/argocd
+      
+      - name: Argocd repo add and app create
+        shell: bash
+        run: |
+          repo="https://github.com/cdproyect-org/python-backstage-app.git"
+          argocd login argo-cd-argocd-server.argocd \
+            --plaintext \
+            --insecure \
+            --grpc-web \
+            --username admin \
+            --password ${{ secrets.ARGOCD_PASSWORD }}
+          # Connects the argocd repo
+          argocd repo list | grep -q $repo || argocd repo add $repo
+          # Creates the argocd app
+          argocd app get python-backstage-app || argocd app create python-backstage-app \
+            --repo $repo \
+            --path charts/python-backstage-app \
+            --dest-server https://kubernetes.default.svc \
+            --dest-namespace dev \
+            --values values-dev.yaml \
+            --revision main \
+            --sync-policy manual \
+            --sync-option CreateNamespace=true 
+        
+      - name: Argocd app sync
+        shell: bash
+        run: |
+          argocd login argo-cd-argocd-server.argocd \
+            --plaintext \
+            --insecure \
+            --grpc-web \
+            --username admin \
+            --password ${{ secrets.ARGOCD_PASSWORD }}
+          argocd app sync python-backstage-app
+          argocd app wait python-backstage-app --timeout 180
